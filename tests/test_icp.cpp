@@ -11,7 +11,9 @@
 
 #include "icp3d/icp.h"
 #include "icp3d/kdtree.h"
+#include "icp3d/multiscan.h"
 #include "icp3d/rigid.h"
+#include "icp3d/se3.h"
 
 using namespace icp3d;
 
@@ -47,6 +49,43 @@ Eigen::Matrix4d makeTransform(const Eigen::Matrix3d &rotation,
   transform.topLeftCorner<3, 3>() = rotation;
   transform.topRightCorner<3, 1>() = translation;
   return transform;
+}
+
+Eigen::Matrix4d translationPose(double x, double y, double z) {
+  return makeTransform(Eigen::Matrix3d::Identity(),
+                       Eigen::Vector3d(x, y, z));
+}
+
+PointCloud makeGlobalGrid() {
+  PointCloud points;
+  for (int x = 0; x <= 4; ++x) {
+    for (int y = 0; y <= 4; ++y) {
+      for (int z = 0; z <= 4; ++z) {
+        points.emplace_back(static_cast<double>(x), static_cast<double>(y),
+                            static_cast<double>(z));
+      }
+    }
+  }
+  return points;
+}
+
+PointCloud selectGlobalPoints(const std::vector<int> &indices) {
+  const PointCloud global = makeGlobalGrid();
+  PointCloud selected;
+  for (int index : indices) {
+    selected.push_back(global[static_cast<std::size_t>(index)]);
+  }
+  return selected;
+}
+
+PointCloud toLocal(const PointCloud &global, const Eigen::Matrix4d &pose) {
+  PointCloud local;
+  const Eigen::Matrix4d inversePose = pose.inverse();
+  for (const Point &point : global) {
+    Eigen::Vector4d homogeneous(point.x(), point.y(), point.z(), 1.0);
+    local.push_back((inversePose * homogeneous).head<3>());
+  }
+  return local;
 }
 
 void testKdTree() {
@@ -141,6 +180,84 @@ void testRigidEstimate() {
     scaledRotation = true;
   }
   check(scaledRotation, "含缩放的旋转被拒绝");
+
+  PointCloud planarSource{
+      {0, 0, 0}, {1, 0, 0}, {0, 1, 0}};
+  std::vector<Correspondence> planarPairs;
+  for (const Point &point : planarSource) {
+    planarPairs.push_back({point, rotation * point + translation});
+  }
+  const RigidTransform planarEstimate = estimateRigid(planarPairs);
+  check(planarEstimate.rotation.isApprox(rotation, 1e-10) &&
+            planarEstimate.translation.isApprox(translation, 1e-10),
+        "非共线平面三点不被误判退化");
+}
+
+void testSe3() {
+  std::cout << "[SE3]\n";
+  Se3Tangent tangent;
+  tangent << 0.4, -0.2, 0.3, 0.08, -0.05, 0.12;
+  const Se3Pose pose = expSe3(tangent);
+  check(logSe3(pose).isApprox(tangent, 1e-10), "SE3 exp/log 往返一致");
+
+  const Se3Pose a{Eigen::AngleAxisd(0.25, Eigen::Vector3d::UnitY())
+                      .toRotationMatrix(),
+                  Eigen::Vector3d(1.0, 0.0, -0.5)};
+  const Se3Pose b{Eigen::AngleAxisd(-0.1, Eigen::Vector3d::UnitX())
+                      .toRotationMatrix(),
+                  Eigen::Vector3d(-0.5, 0.4, 0.8)};
+  const Se3Pose ab = multiply(a, b);
+  const Se3Pose identity = multiply(inverse(a), a);
+  check(poseToMatrix4(ab).isApprox(poseToMatrix4(a) * poseToMatrix4(b)),
+        "SE3 组合与齐次矩阵乘法一致");
+  check(poseToMatrix4(identity).isApprox(Eigen::Matrix4d::Identity(), 1e-12),
+        "SE3 逆变换正确");
+  check(relativeLog(a, a, identity).norm() < 1e-12,
+        "测量等于预测时 SE3 对数残差为零");
+}
+
+void testPoseGraph() {
+  std::cout << "[PoseGraph]\n";
+  std::vector<Se3Pose> truePoses(4);
+  std::vector<Se3Pose> driftedPoses(4);
+  for (int i = 0; i < 4; ++i) {
+    truePoses[i].translation =
+        Eigen::Vector3d(static_cast<double>(i), 0.0, 0.0);
+    driftedPoses[i].translation =
+        Eigen::Vector3d(1.05 * static_cast<double>(i), 0.0, 0.0);
+  }
+
+  std::vector<PoseGraphEdge> edges;
+  auto addEdge = [&](int source, int target, bool loop) {
+    PoseGraphEdge edge;
+    edge.source = source;
+    edge.target = target;
+    edge.measurement =
+        multiply(inverse(truePoses[target]), truePoses[source]);
+    edge.loopClosure = loop;
+    edges.push_back(edge);
+  };
+  addEdge(0, 1, false);
+  addEdge(1, 2, false);
+  addEdge(2, 3, false);
+  addEdge(0, 3, true);
+
+  PoseGraphConfig config;
+  config.maxIterations = 50;
+  config.convergenceTolerance = 1e-12;
+  config.huberDelta = 1.0;
+  const PoseGraphResult result =
+      optimizePoseGraph(driftedPoses, edges, config);
+  check(result.converged && result.finalObjective < result.initialObjective,
+        "累计漂移经闭环联合优化后目标下降");
+  bool recovered = true;
+  for (int i = 0; i < 4; ++i) {
+    recovered &= result.poses[i].translation.isApprox(
+        truePoses[i].translation, 1e-6);
+  }
+  check(recovered, "联合优化恢复各站平移而非逐边串乘");
+  check(poseToMatrix4(result.poses[0]).isApprox(Eigen::Matrix4d::Identity()),
+        "首站位姿在优化中固定");
 }
 
 PointCloud makeSphereCloud(std::size_t count) {
@@ -223,6 +340,113 @@ void testIcp() {
         "达到次数上限返回未收敛及当前估计");
 }
 
+void testMultiScan() {
+  std::cout << "[MultiScan]\n";
+  std::vector<PointCloud> globals(4);
+  std::vector<int> shared;
+  for (int y = 0; y <= 2; ++y) {
+    for (int z = 0; z <= 2; ++z) {
+      shared.push_back(y * 25 + z * 5);
+    }
+  }
+  globals[0] = selectGlobalPoints(shared);
+  globals[1] = selectGlobalPoints({
+      25, 26, 27, 30, 31, 32, 50, 51, 52, 55, 56, 57});
+  globals[2] = selectGlobalPoints({
+      50, 51, 52, 55, 56, 57, 75, 76, 77, 80, 81, 82});
+  globals[3] = selectGlobalPoints(shared);
+  for (int &index : shared) {
+    index += 75;
+  }
+  for (int point : shared) {
+    globals[3].push_back(makeGlobalGrid()[static_cast<std::size_t>(point)]);
+  }
+
+  std::vector<Eigen::Matrix4d> truePoses{
+      translationPose(0, 0, 0), translationPose(1, 0, 0),
+      translationPose(2, 0, 0), translationPose(3, 0, 0)};
+  std::vector<Eigen::Matrix4d> initialPoses{
+      translationPose(0, 0, 0), translationPose(1.08, 0.02, -0.02),
+      translationPose(2.18, 0.03, 0.01), translationPose(3.30, 0.0, 0.0)};
+
+  std::vector<PointCloud> scans(4);
+  for (int i = 0; i < 4; ++i) {
+    scans[i] = toLocal(globals[i], truePoses[i]);
+  }
+  const auto initialCopy = initialPoses;
+
+  std::vector<ScanEdgeSpec> specs{
+      {0, 1, EdgeKind::Adjacent, 1.0, 1.0},
+      {1, 2, EdgeKind::Adjacent, 1.0, 1.0},
+      {2, 3, EdgeKind::Adjacent, 1.0, 1.0},
+      {0, 3, EdgeKind::LoopClosure, 1.0, 1.0}};
+
+  MultiScanConfig config;
+  config.icp.maxIterations = 80;
+  config.icp.maxCorrespondenceDistance = 0.4;
+  config.icp.translationTolerance = 1e-9;
+  config.icp.rotationTolerance = 1e-9;
+  config.maxIterations = 80;
+  config.convergenceTolerance = 1e-12;
+  config.huberDelta = 1.0;
+
+  const MultiScanResult result =
+      correctMultiScan(scans, initialPoses, specs, config);
+  check(result.success && result.reason == MultiScanTermination::Converged,
+        "含闭环的多站校正收敛");
+  check(result.edgeStatuses.size() == 4 &&
+            result.edgeStatuses[3].kind == EdgeKind::LoopClosure &&
+            result.edgeStatuses[3].accepted,
+        "逐边原因和闭环类型被返回");
+  bool poseRecovered = true;
+  double fusedError = 0.0;
+  for (int i = 0; i < 4; ++i) {
+    poseRecovered &= result.poses[i].isApprox(truePoses[i], 1e-6);
+  }
+  std::size_t fusedPointIndex = 0;
+  for (std::size_t station = 0; station < scans.size(); ++station) {
+    for (const Point &localPoint : scans[station]) {
+      Eigen::Vector4d homogeneous(localPoint.x(), localPoint.y(),
+                                  localPoint.z(), 1.0);
+      const Point fused = (result.poses[station] * homogeneous).head<3>();
+      fusedError += (fused - result.fusedCloud[fusedPointIndex++]).norm();
+    }
+  }
+  check(poseRecovered, "闭环校正恢复各站全局位姿");
+  check(fusedError == 0.0 &&
+            result.fusedCloud.size() == scans[0].size() + scans[1].size() +
+                                    scans[2].size() + scans[3].size(),
+        "按最终联合位姿拼接全部原始点");
+  check(result.finalObjective < result.initialObjective,
+        "返回初末目标值且末值下降");
+  bool inputUnchanged = (initialPoses == initialCopy);
+  check(inputUnchanged, "重复使用的初始位姿输入不被修改");
+
+  const std::vector<ScanEdgeSpec> adjacentOnly{
+      {0, 1, EdgeKind::Adjacent, 1.0, 1.0},
+      {2, 3, EdgeKind::Adjacent, 1.0, 1.0}};
+  const MultiScanResult missingLoop =
+      correctMultiScan(scans, initialPoses, adjacentOnly, config);
+  check(!missingLoop.success &&
+            missingLoop.reason == MultiScanTermination::GraphDisconnected,
+        "有效边图不连通时明确失败");
+
+  const MultiScanResult repeated =
+      correctMultiScan(scans, initialPoses, specs, config);
+  check(repeated.success && repeated.initialObjective == result.initialObjective,
+        "重复调用互不污染");
+
+  bool rejectsSelfLoop = false;
+  try {
+    auto invalid = specs;
+    invalid[0].targetStation = 0;
+    correctMultiScan(scans, initialPoses, invalid, config);
+  } catch (const std::invalid_argument &) {
+    rejectsSelfLoop = true;
+  }
+  check(rejectsSelfLoop, "拒绝自环边");
+}
+
 void testValidation() {
   std::cout << "[Validation]\n";
   PointCloud cloud;
@@ -268,7 +492,10 @@ void testValidation() {
 int main() {
   testKdTree();
   testRigidEstimate();
+  testSe3();
+  testPoseGraph();
   testIcp();
+  testMultiScan();
   testValidation();
   std::cout << "\n共 " << g_checks << " 项检查，失败 " << g_failures
             << " 项\n";

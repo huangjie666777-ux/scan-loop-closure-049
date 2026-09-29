@@ -35,9 +35,9 @@ struct Correspondence {
 };
 
 // 由保留配对求最小二乘刚体增量（Umeyama/Horn，SVD 求解），无缩放。
-// 配对少于 3 组，或去质心协方差矩阵秩不足（sigma3 <=
-// rankEpsilon * max(1, sigma1)，例如共线/共面点云）时抛出
-// std::runtime_error，调用方可据此报告 DegenerateGeometry。
+// 配对少于 3 组，或去质心后点集共线（sigma2 <=
+// rankEpsilon * max(1, sigma1)）时抛出 std::runtime_error。
+// 非共线平面点（协方差秩为 2）仍可唯一确定刚体旋转。
 RigidTransform estimateRigid(const std::vector<Correspondence> &pairs,
                              double rankEpsilon = 1e-10);
 

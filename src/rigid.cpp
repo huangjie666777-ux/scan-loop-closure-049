@@ -107,9 +107,9 @@ RigidTransform estimateRigid(const std::vector<Correspondence> &pairs,
   const Eigen::Matrix3d &u = svd.matrixU();
   const Eigen::Matrix3d &v = svd.matrixV();
   const double rankThreshold = rankEpsilon * std::max(1.0, s(0));
-  if (s(2) <= rankThreshold) {
+  if (s(1) <= rankThreshold) {
     throw std::runtime_error(
-        "配对几何退化（协方差矩阵秩不足），无法唯一确定旋转");
+        "配对几何退化（点集共线），无法唯一确定旋转");
   }
 
   Eigen::Matrix3d rotation = u * v.transpose();
