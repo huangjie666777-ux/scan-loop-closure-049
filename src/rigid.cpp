@@ -106,10 +106,13 @@ RigidTransform estimateRigid(const std::vector<Correspondence> &pairs,
   const Eigen::Vector3d &s = svd.singularValues();
   const Eigen::Matrix3d &u = svd.matrixU();
   const Eigen::Matrix3d &v = svd.matrixV();
+  // 去质心点集秩为 2（非共线三点/平面）即可唯一确定刚体：平面法向
+  // 唯一，SVD 仍能给出正确旋转（平面点云不再被误判为退化）。只有秩
+  // 不足 2（全部共线）时，绕点列方向的旋转不可观，才判退化。
   const double rankThreshold = rankEpsilon * std::max(1.0, s(0));
-  if (s(2) <= rankThreshold) {
+  if (s(1) <= rankThreshold) {
     throw std::runtime_error(
-        "配对几何退化（协方差矩阵秩不足），无法唯一确定旋转");
+        "配对几何退化（点集共线、秩不足 2），无法唯一确定旋转");
   }
 
   Eigen::Matrix3d rotation = u * v.transpose();

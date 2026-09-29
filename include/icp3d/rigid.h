@@ -35,9 +35,10 @@ struct Correspondence {
 };
 
 // 由保留配对求最小二乘刚体增量（Umeyama/Horn，SVD 求解），无缩放。
-// 配对少于 3 组，或去质心协方差矩阵秩不足（sigma3 <=
-// rankEpsilon * max(1, sigma1)，例如共线/共面点云）时抛出
-// std::runtime_error，调用方可据此报告 DegenerateGeometry。
+// 配对少于 3 组，或去质心点集共线（秩 < 2，sigma2 <=
+// rankEpsilon * max(1, sigma1)）时抛出 std::runtime_error，调用方可据此
+// 报告 DegenerateGeometry。注意：非共线三点/平面（秩 2）即可唯一确定
+// 刚体变换（平面法向由点集张成的平面唯一给出），不会被误判为退化。
 RigidTransform estimateRigid(const std::vector<Correspondence> &pairs,
                              double rankEpsilon = 1e-10);
 
